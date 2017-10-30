@@ -1038,9 +1038,10 @@ func (e *Endpoint) Update(owner Owner, opts models.ConfigurationMap) error {
 
 	// Option changes may be overridden by the policy configuration.
 	// Currently we return all-OK even in that case.
-	changed, err := e.TriggerPolicyUpdatesLocked(owner, opts)
+	changed, ctCleaned, err := e.TriggerPolicyUpdatesLocked(owner, opts)
 	if err != nil {
 		e.Mutex.Unlock()
+		<-ctCleaned
 		return UpdateCompilationError{err.Error()}
 	}
 
@@ -1048,6 +1049,8 @@ func (e *Endpoint) Update(owner Owner, opts models.ConfigurationMap) error {
 		changed = e.SetStateLocked(StateWaitingToRegenerate, "Updated endpoint options; policy changes apply to this endpoint")
 	}
 	e.Mutex.Unlock()
+
+	<-ctCleaned
 
 	if changed {
 		e.Regenerate(owner, "updated endpoint options & policy changes apply to this endpoint")
