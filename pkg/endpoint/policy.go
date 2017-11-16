@@ -529,7 +529,18 @@ func (e *Endpoint) regenerate(owner Owner) error {
 		return fmt.Errorf("Failed to create endpoint directory: %s", err)
 	}
 
-	if err := e.regenerateBPF(owner, tmpDir); err != nil {
+	defer func() {
+		// Set to Ready, but only if no other changes are pending.
+		// State will remain as waiting-to-regenerate if further
+		// changes are needed. There should be an another regenerate
+		// queued for taking care of it.
+		e.Mutex.Lock()
+		e.BuilderSetStateLocked(StateReady)
+		e.Mutex.Unlock()
+	}()
+
+	revision, err := e.regenerateBPF(owner, tmpDir)
+	if err != nil {
 		os.RemoveAll(tmpDir)
 		return err
 	}
@@ -558,14 +569,11 @@ func (e *Endpoint) regenerate(owner Owner) error {
 
 	os.RemoveAll(backupDir)
 
-	// Set to Ready, but only if no other changes are pending.
-	// State will remain as waiting-to-regenerate if further
-	// changes are needed. There should be an another regenerate
-	// queued for taking care of it.
-	e.Mutex.Lock()
-	e.BuilderSetStateLocked(StateReady)
+	// Mark the endpoint to be running the policy revision it was
+	// compiled for
+	e.bumpPolicyRevision(revision)
+
 	e.getLogger().Info("Regenerated program of endpoint")
-	e.Mutex.Unlock()
 
 	return nil
 }
@@ -599,6 +607,7 @@ func (e *Endpoint) Regenerate(owner Owner) <-chan bool {
 
 			if err := e.regenerate(owner); err != nil {
 				buildSuccess = false
+				scopedLog.WithError(err).Warn("Regeneration of endpoint program failed")
 				e.LogStatus(BPF, Failure, err.Error())
 			} else {
 				buildSuccess = true

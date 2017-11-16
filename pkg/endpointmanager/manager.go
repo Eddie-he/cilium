@@ -250,9 +250,10 @@ func TriggerPolicyUpdates(owner endpoint.Owner) *sync.WaitGroup {
 		go func(ep *endpoint.Endpoint, wg *sync.WaitGroup) {
 			ep.Mutex.Lock()
 			policyChanges, err := ep.TriggerPolicyUpdatesLocked(owner, nil)
+			regen := false
 			if err == nil && policyChanges {
 				// Regenerate only if state transition succeeds
-				policyChanges = ep.SetStateLocked(endpoint.StateWaitingToRegenerate)
+				regen = ep.SetStateLocked(endpoint.StateWaitingToRegenerate)
 			}
 			ep.Mutex.Unlock()
 
@@ -260,12 +261,12 @@ func TriggerPolicyUpdates(owner endpoint.Owner) *sync.WaitGroup {
 				log.WithError(err).Warn("Error while handling policy updates for endpoint")
 				ep.LogStatus(endpoint.Policy, endpoint.Failure, err.Error())
 			} else {
-				if policyChanges {
-					<-ep.Regenerate(owner)
-					ep.LogStatusOK(endpoint.Policy, "Policy regenerated")
-				} else {
+				if !policyChanges {
 					ep.LogStatusOK(endpoint.Policy, "Policy regeneration skipped")
-				}
+				} else if regen {
+					// Regenerate logs status according to the build success/failure
+					<-ep.Regenerate(owner)
+				} // else policy changed, but can't regenerate => do not change status
 			}
 			wg.Done()
 		}(Endpoints[k], &wg)
