@@ -32,24 +32,10 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// deleteNonFunctionalEndpoints cleans all endpoints that do not have a running
-// container associated with it.
-func (d *Daemon) deleteNonFunctionalEndpoints() {
-	for _, ep := range endpointmanager.Endpoints {
-		if !containerd.IsRunning(ep) {
-			log.WithFields(log.Fields{
-				logfields.EndpointID: ep.StringID(),
-			}).Info("No workload could be associated with endpoint, removing endpoint")
-			d.deleteEndpoint(ep)
-		}
-	}
-}
-
 // SyncState syncs cilium state against the containers running in the host. dir is the
 // cilium's running directory. If clean is set, the endpoints that don't have its
 // container in running state are deleted.
 func (d *Daemon) SyncState(dir string, clean bool) error {
-	restored := 0
 
 	log.Info("Restoring old cilium endpoints...")
 
@@ -66,86 +52,104 @@ func (d *Daemon) SyncState(dir string, clean bool) error {
 		return nil
 	}
 
-	for _, ep := range possibleEPs {
-		ep.Mutex.Lock()
-		log.WithField(logfields.EndpointID, ep.ID).Debug("Restoring endpoint")
-
-		if err := d.syncLabels(ep); err != nil {
-			log.WithError(err).WithField(logfields.EndpointID, ep.ID).Warn("Unable to restore endpoint")
-			ep.Mutex.Unlock()
-			continue
-		}
-
-		if d.conf.KeepConfig {
-			ep.SetDefaultOpts(nil)
-		} else {
-			ep.SetDefaultOpts(d.conf.Opts)
-			alwaysEnforce := policy.GetPolicyEnabled() == endpoint.AlwaysEnforce
-			ep.Opts.Set(endpoint.OptionPolicy, alwaysEnforce)
-		}
-
-		endpointmanager.Insert(ep)
-		restored++
-
-		ep.Mutex.Unlock()
-	}
-
-	if clean {
-		d.deleteNonFunctionalEndpoints()
-	}
-
 	endpointmanager.Mutex.Lock()
-	nEndpoints := len(endpointmanager.Endpoints)
-	wg := make(chan bool, nEndpoints)
-	for _, ep := range endpointmanager.Endpoints {
-		go func(ep *endpoint.Endpoint, wg chan<- bool) {
+	nEndpoints := len(possibleEPs)
+
+	epRegenerated := make(chan bool, nEndpoints)
+	epGistRegenerated := make(chan bool, nEndpoints)
+
+	for _, ep := range possibleEPs {
+		go func(ep *endpoint.Endpoint, epGistRegenerated, epRegenerated chan<- bool) {
 			scopedLog := log.WithField(logfields.EndpointID, ep.ID)
+			if clean && !containerd.IsRunning(ep) {
+				scopedLog.Info("No workload could be associated with endpoint, removing endpoint")
+				d.deleteEndpoint(ep)
+				epRegenerated <- false
+				epGistRegenerated <- false
+				return
+			}
+
 			ep.Mutex.Lock()
+			scopedLog.Debug("Restoring endpoint")
+
 			if err := d.allocateIPsLocked(ep); err != nil {
 				ep.Mutex.Unlock()
 				scopedLog.WithError(err).Error("Failed to re-allocate IP of endpoint. Not restoring endpoint.")
 				d.deleteEndpoint(ep)
-				wg <- false
+				epRegenerated <- false
+				epGistRegenerated <- false
 				return
 			}
-			ready := ep.SetStateLocked(endpoint.StateWaitingToRegenerate, "Triggering synchronous endpoint regeneration while syncing state to host")
+
+			if d.conf.KeepConfig {
+				ep.SetDefaultOpts(nil)
+			} else {
+				ep.SetDefaultOpts(d.conf.Opts)
+				alwaysEnforce := policy.GetPolicyEnabled() == endpoint.AlwaysEnforce
+				ep.Opts.Set(endpoint.OptionPolicy, alwaysEnforce)
+			}
+
+			endpointmanager.Insert(ep)
+			epGistRegenerated <- true
+
+			if err := d.syncLabels(ep); err != nil {
+				scopedLog.WithError(err).Warn("Unable to restore endpoint")
+				ep.Mutex.Unlock()
+				return
+			}
+			ready := ep.SetStateLocked(endpoint.StateRestoring, "Triggering synchronous endpoint regeneration while syncing state to host")
 			ep.Mutex.Unlock()
+
 			if !ready {
 				scopedLog.WithField(logfields.EndpointState, ep.GetState()).Warn("Endpoint in inconsistent state")
-				wg <- false
+				epRegenerated <- false
 				return
 			}
 			if buildSuccess := <-ep.Regenerate(d, "syncing state to host"); !buildSuccess {
 				scopedLog.Warn("Failed while regenerating endpoint")
-				wg <- false
+				epRegenerated <- false
 				return
 			}
+
 			ep.Mutex.RLock()
 			scopedLog.WithField(logfields.IPAddr, []string{ep.IPv4.String(), ep.IPv6.String()}).Info("Restored endpoint with IPs")
 			ep.Mutex.RUnlock()
-			wg <- true
-		}(ep, wg)
+			epRegenerated <- true
+		}(ep, epGistRegenerated, epRegenerated)
 	}
 	endpointmanager.Mutex.Unlock()
 
-	restored, total := 0, 0
-	if nEndpoints > 0 {
-		for buildSuccess := range wg {
-			if buildSuccess {
-				restored++
-			}
-			total++
-			if total >= nEndpoints {
-				break
+	go func() {
+		restored, total := 0, 0
+		if nEndpoints > 0 {
+			for buildSuccess := range epRegenerated {
+				if buildSuccess {
+					restored++
+				}
+				total++
+				if total >= nEndpoints {
+					break
+				}
 			}
 		}
-	}
-	close(wg)
+		close(epRegenerated)
 
-	log.WithFields(log.Fields{
-		"count.restored": restored,
-		"count.total":    total,
-	}).Info("Found endpoints of which some were restored")
+		log.WithFields(log.Fields{
+			"count.restored": restored,
+			"count.total":    total,
+		}).Info("Found endpoints of which some were restored")
+	}()
+
+	// We need to wait for the endpoints IPs and labels
+	// are properly synced before continuing.
+	nEPsGistRegenerated := 0
+	for range epGistRegenerated {
+		nEPsGistRegenerated++
+		if nEPsGistRegenerated >= nEndpoints {
+			break
+		}
+	}
+	close(epGistRegenerated)
 
 	return nil
 }

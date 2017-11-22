@@ -173,30 +173,6 @@ func (ds *DaemonSuite) TestReadEPsFromDirNames(c *C) {
 	c.Assert(len(eps), Equals, len(epsWanted))
 }
 
-func (ds *DaemonSuite) TestCleanUpDockerDangling(c *C) {
-	epsWanted, epsMap := createEndpoints()
-
-	err := containerd.InitMock()
-	c.Assert(err, IsNil)
-
-	for _, ep := range epsWanted {
-		endpointmanager.Insert(ep)
-	}
-
-	ep, err := endpointmanager.Lookup(e.NewCiliumID(259))
-	c.Assert(err, IsNil)
-	c.Assert(ep, comparator.DeepEquals, epsMap[259])
-
-	ds.d.deleteNonFunctionalEndpoints()
-
-	// Since 259 doesn't exist in the list of docker network endpoint running,
-	// it will be removed from the list of endpoints
-
-	ep, err = endpointmanager.Lookup(e.NewCiliumID(259))
-	c.Assert(err, IsNil)
-	c.Assert(ep, IsNil)
-}
-
 func (ds *DaemonSuite) TestSyncLabels(c *C) {
 	epsWanted, _ := createEndpoints()
 
